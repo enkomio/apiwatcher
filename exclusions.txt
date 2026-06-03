@@ -1,0 +1,189 @@
+# probes
+ntdll.__chkstk
+ntdll.__C_specific_handler
+ntdll.RtlReportException
+ntdll.NtRaiseException
+ntdll.KiUserExceptionDispatcher
+
+# heap
+ntdll.RtlAllocateHeap
+ntdll.RtlFreeHeap
+
+# critical sections
+ntdll.RtlEnterCriticalSection
+ntdll.RtlLeaveCriticalSection
+ntdll.RtlTryEnterCriticalSection
+
+# SRW locks (chiamate su ogni accesso a struttura condivisa)
+ntdll.RtlAcquireSRWLockShared
+ntdll.RtlReleaseSRWLockShared
+ntdll.RtlAcquireSRWLockExclusive
+ntdll.RtlReleaseSRWLockExclusive
+ntdll.RtlTryAcquireSRWLockShared
+ntdll.RtlTryAcquireSRWLockExclusive
+
+# activation context SxS (chiamata internamente dal loader ad ogni call DLL)
+ntdll.RtlActivateActivationContextUnsafeFast
+ntdll.RtlDeactivateActivationContextUnsafeFast
+ntdll.RtlActivateActivationContext
+ntdll.RtlDeactivateActivationContext
+
+# memory primitives
+ntdll.RtlCopyMemory
+ntdll.RtlMoveMemory
+ntdll.RtlFillMemory
+ntdll.RtlZeroMemory
+ntdll.RtlUnicodeToMultiByteN
+ntdll.RtlAnsiCharToUnicodeChar
+memset
+memcpy
+memmove
+
+# string utilities
+strlen
+wcslen
+strrchr
+strchr
+wcsrchr
+ntdll.RtlCompareUnicodeStrings
+ntdll.RtlEqualUnicodeString
+ntdll.RtlAnsiStringToUnicodeString
+ntdll.RtlUnicodeStringToAnsiString
+ntdll.RtlInitUnicodeString
+ntdll.RtlInitAnsiString
+ntdll.RtlCopyUnicodeString
+
+# PE / loader internals
+ntdll.RtlImageNtHeaderEx
+ntdll.RtlImageNtHeader
+ntdll.RtlImageDirectoryEntryToData
+ntdll.RtlImageRvaToVa
+ntdll.RtlImageRvaToSection
+
+# string compare / search (case-insensitive variants, very high frequency)
+_wcsicmp
+_wcsnicmp
+_strnicmp
+wcschr
+wcscpy_s
+strcpy_s
+memcmp
+
+# printf / formatting
+_vsnwprintf
+_vsnprintf
+
+# string init / append / free
+ntdll.RtlInitString
+ntdll.RtlInitUnicodeStringEx
+ntdll.RtlAppendUnicodeStringToString
+ntdll.RtlAppendUnicodeToString
+ntdll.RtlFreeAnsiString
+
+# activation context helpers (called on each SxS-aware import)
+ntdll.RtlAddRefActivationContext
+ntdll.RtlFindActivationContextSectionString
+ntdll.RtlFindCharInUnicodeString
+ntdll.RtlDosApplyFileIsolationRedirection_Ustr
+
+# internal data structures (red-black tree, AVL tree, interlocked SList)
+ntdll.RtlRbInsertNodeEx
+ntdll.RtlAvlInsertNodeEx
+ntdll.RtlInterlockedPopEntrySList
+ntdll.ExpInterlockedPopEntrySListResume
+
+# NTDLL misc internals
+ntdll.RtlGetCurrentServiceSessionId
+ntdll.RtlDeleteBoundaryDescriptor
+ntdll.RtlRestoreLastWin32Error
+ntdll.RtlQueryFeatureConfiguration
+ntdll.RtlQueryInternalFeatureConfiguration
+ntdll.LdrControlFlowGuardEnforced
+ntdll.RtlInitializeCriticalSectionEx
+
+# ETW (Event Tracing for Windows — initialization noise)
+ntdll.EtwEventRegister
+ntdll.EtwNotificationRegister
+ntdll.EtwEventSetInformation
+ntdll.NtTraceControl
+
+# AppHelp SDB (shim database — called in burst during loader compat checks)
+apphelp.SdbGetTagFromTagID
+apphelp.SdbGetTagDataSize
+apphelp.SdbGetFirstChild
+apphelp.SdbGetNextChild
+apphelp.SdbFindFirstTag
+apphelp.SdbGetDatabaseID
+apphelp.SdbReadBinaryTag
+apphelp.SdbUnpackAppCompatData
+
+# SEH / stack unwinding (chiamate su ogni eccezione — estremo rumore)
+ntdll.RtlLookupFunctionEntry
+ntdll.RtlLookupFunctionTable
+ntdll.RtlInitializeExtendedContext2
+ntdll.RtlGetExtendedContextLength2
+ntdll.RtlCaptureContext
+ntdll.IsThreadAFiber
+ntdll._seh_filter_dll
+ntdll._o__seh_filter_dll
+ntdll.ZwRaiseException
+ntdll.NtRaiseException
+# NtQueryInformationProcess e variante Zw (stesso syscall, due export)
+ntdll.NtQueryInformationProcess
+ntdll.ZwQueryInformationProcess
+# Funzioni SEH presenti anche in DLL CRT (vcruntime, ucrtbase) — senza prefisso
+IsThreadAFiber
+__C_specific_handler
+_seh_filter_dll
+_o__seh_filter_dll
+
+# NT kernel — high-frequency, low-value
+ntdll.NtClose
+ntdll.ZwClose
+#ntdll.NtOpenKey
+#ntdll.NtQueryValueKey
+ntdll.NtQueryVirtualMemory
+ntdll.ZwQueryVirtualMemory
+
+# LDR internals
+ntdll.LdrGetProcedureAddressForCaller
+ntdll.LdrGetDllHandle
+ntdll.LdrGetDllFullName
+ntdll.LdrFindEntryForAddress
+
+# CRT / runtime
+bsearch
+qsort
+GetLastError
+GetCurrentProcessId
+RtlSetLastWin32Error
+InitializeCriticalSectionEx
+
+# CRT allocatori e stdlib (molto chiamati da COM internamente)
+malloc
+free
+realloc
+calloc
+_malloc_base
+_free_base
+_calloc_base
+_realloc_base
+_o_malloc
+_o_free
+_o_calloc
+_o_realloc
+memcpy_s
+memmove_s
+_register_onexit_function
+_o__register_onexit_function
+_crt_atexit
+_atexit_helper
+
+# CRT locale / facet (locking interno)
+_lock_locales
+_unlock_locales
+
+# COM / OLE init (exception che genera RPC_E_CALL_REJECTED — gestita internamente)
+CoInitialize
+CoInitializeEx
+CoUninitialize

@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "apiwatcher",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/target/debug/apiwatcher.exe",
+            "args": [
+                "-o", "apiwatcher.csv",
+                "--only-main",
+                "--exclude-file", "exclusions.txt",
+                "--",
+                "C:\\Windows\\System32\\notepad.exe"
+            ],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "cargo build (debug)",
+            "console": "integratedTerminal"
+        }
+    ]
+}

@@ -1,0 +1,23 @@
+[package]
+name = "apiwatcher"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "apiwatcher"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
+[profile.release]
+panic = "abort"

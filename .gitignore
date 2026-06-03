@@ -1,0 +1,4 @@
+/target
+/pin_tool/obj-*
+*.log
+*.csv
