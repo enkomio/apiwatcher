@@ -109,6 +109,31 @@ pub fn dll_basename(dll: &str) -> &str {
     basename(dll)
 }
 
+/// Read `AddressOfEntryPoint` from the PE optional header and return the
+/// absolute address in the target process.
+///
+/// Returns `None` when the field is zero (resource-only DLLs, etc.) or when
+/// the PE header cannot be read.
+pub fn get_entry_point(proc: HANDLE, base: usize) -> Option<usize> {
+    let e_lfanew = read_u32(proc, base + 0x3C)? as usize;
+    // PE signature "PE\0\0"
+    if read_u32(proc, base + e_lfanew) != Some(0x0000_4550) {
+        return None;
+    }
+    // Optional header starts right after the 4-byte signature and the 20-byte
+    // COFF file header.
+    let opt = base + e_lfanew + 24;
+    match read_u16(proc, opt)? {
+        0x020B | 0x010B => {
+            // AddressOfEntryPoint is at offset +16 inside the optional header
+            // for both PE32 and PE32+.
+            let ep_rva = read_u32(proc, opt + 16)? as usize;
+            if ep_rva == 0 { None } else { Some(base + ep_rva) }
+        }
+        _ => None,
+    }
+}
+
 // ── Export table ──────────────────────────────────────────────────────────────
 
 pub struct Export {

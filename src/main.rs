@@ -36,8 +36,9 @@ struct Args {
     #[arg(long = "only-main")]
     only_main: bool,
 
-    /// Restrict logging to calls targeting this DLL (e.g. kernel32 or kernel32.dll).
-    /// Case-insensitive; .dll extension is optional. Combined with --only_main via AND.
+    /// Log only calls whose *caller* image matches this name (e.g. myapp or myapp.exe).
+    /// Case-insensitive; .dll/.exe extension is optional.
+    /// Combined with --only-main via AND.
     #[arg(long = "dll", value_name = "NAME")]
     dll_filter: Option<String>,
 
@@ -48,8 +49,29 @@ struct Args {
     exclude: Vec<String>,
 
     /// File containing exclusion patterns, one per line (lines starting with # are comments).
+    /// Defaults to "exclusions.txt" if the file exists.
     #[arg(long = "exclude-file", value_name = "FILE")]
     exclude_file: Option<String>,
+
+    /// Always hook functions matching this regex, even if they also match an exclusion.
+    /// Inclusions take priority over exclusions.
+    /// Can be repeated.
+    #[arg(long = "include", value_name = "PATTERN", action = clap::ArgAction::Append)]
+    include: Vec<String>,
+
+    /// File containing inclusion patterns, one per line (lines starting with # are comments).
+    /// Inclusions take priority over exclusions.
+    /// Defaults to "inclusions.txt" if the file exists.
+    #[arg(long = "include-file", value_name = "FILE")]
+    include_file: Option<String>,
+
+    /// IAT-only mode: hook only functions imported by the main EXE via its
+    /// Import Address Table, plus any function address returned at runtime by
+    /// GetProcAddress.  Produces a much smaller hook set than the default
+    /// full-EAT mode and is ideal for analysing what an application actually
+    /// calls rather than what every loaded DLL exports.
+    #[arg(long = "trace-iat")]
+    trace_iat: bool,
 
     /// Directory containing .h function-definition files
     #[arg(long = "defs", default_value = "defs")]
@@ -89,8 +111,9 @@ fn parse_exclusion_pattern(raw: &str) -> Option<Regex> {
     }
 }
 
-/// Build the exclusion pattern list from CLI patterns and an optional file.
-fn build_excluded(patterns: &[String], file: Option<&str>) -> Vec<Regex> {
+/// Build a pattern list from CLI patterns and an optional file.
+/// Used for both exclusions and inclusions.
+fn build_patterns(patterns: &[String], file: Option<&str>, label: &str) -> Vec<Regex> {
     let mut out: Vec<Regex> = Vec::new();
 
     let mut add = |s: &str| {
@@ -110,7 +133,7 @@ fn build_excluded(patterns: &[String], file: Option<&str>) -> Vec<Regex> {
                     add(line);
                 }
             }
-            Err(e) => eprintln!("[!] Cannot read exclude file '{}': {}", path, e),
+            Err(e) => eprintln!("[!] Cannot read {} file '{}': {}", label, path, e),
         }
     }
 
@@ -125,10 +148,41 @@ fn main() {
     // Build the full command-line string expected by CreateProcessW.
     let cmdline = args.target.join(" ");
 
-    // Build the exclusion pattern list from inline patterns and optional file.
-    let excluded = build_excluded(&args.exclude, args.exclude_file.as_deref());
+    // Resolve the exclusion file: explicit --exclude-file wins; otherwise fall
+    // back to "exclusions.txt" in the current directory if it exists.
+    const DEFAULT_EXCLUDE_FILE: &str = "exclusions.txt";
+    let exclude_file: Option<&str> = match args.exclude_file.as_deref() {
+        Some(path) => Some(path),
+        None if Path::new(DEFAULT_EXCLUDE_FILE).is_file() => Some(DEFAULT_EXCLUDE_FILE),
+        None => None,
+    };
+    if let Some(f) = exclude_file {
+        if args.exclude_file.is_none() {
+            eprintln!("[*] Using default exclusion file '{}'", f);
+        }
+    }
+
+    // Build exclusion and inclusion pattern lists.
+    let excluded = build_patterns(&args.exclude, exclude_file, "exclusion");
     if !excluded.is_empty() {
         eprintln!("[*] {} exclusion pattern(s) loaded", excluded.len());
+    }
+
+    const DEFAULT_INCLUDE_FILE: &str = "inclusions.txt";
+    let include_file: Option<&str> = match args.include_file.as_deref() {
+        Some(path) => Some(path),
+        None if Path::new(DEFAULT_INCLUDE_FILE).is_file() => Some(DEFAULT_INCLUDE_FILE),
+        None => None,
+    };
+    if let Some(f) = include_file {
+        if args.include_file.is_none() {
+            eprintln!("[*] Using default inclusion file '{}'", f);
+        }
+    }
+
+    let included = build_patterns(&args.include, include_file, "inclusion");
+    if !included.is_empty() {
+        eprintln!("[*] {} inclusion pattern(s) loaded (override exclusions)", included.len());
     }
 
     // Load function definitions from the defs/ directory.
@@ -165,14 +219,18 @@ fn main() {
         use std::io::Write;
         writeln!(
             csv,
-            "timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,params"
+            "timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,params,retval"
         )
         .unwrap();
     }
 
     // Launch and run the tracer.
+    if args.trace_iat {
+        eprintln!("[*] IAT-trace mode: hooking EXE imports + GetProcAddress-resolved functions");
+    }
+
     let (mut dbg, _pid) =
-        Debugger::spawn(&cmdline, csv, args.only_main, args.dll_filter, excluded, db)
+        Debugger::spawn(&cmdline, csv, args.only_main, args.dll_filter, excluded, included, db, args.trace_iat)
             .unwrap_or_else(|e| {
                 eprintln!("Failed to launch target: {}", e);
                 std::process::exit(1);

@@ -9,7 +9,7 @@ mod process;
 
 pub use breakpoint::{Bp, make_context};
 pub use pe::get_module_size;
-use pe::parse_exports;
+use pe::{get_entry_point, parse_exports, parse_imports};
 pub use process::{basename, read_cstr, read_u32, read_u64, read_u8, read_wstr, write_byte};
 
 use std::collections::HashMap;
@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use regex::Regex;
 
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Threading::*;
 
@@ -52,6 +53,21 @@ struct ProcState {
     /// False until the initial ntdll loader INT3 is consumed and breakpoints
     /// have been armed.
     initial_bp_done: bool,
+}
+
+// ── Pending return tracking ───────────────────────────────────────────────────
+
+/// All data needed to emit a complete log line once the hooked function returns.
+struct PendingReturn {
+    ts_sec: u64,
+    ts_usec: u32,
+    tid: u32,
+    caller_image: String,
+    bp_addr: usize,       // address of the hooked function entry point
+    target_image: String,
+    target_routine: String,
+    params_str: String,
+    ret_size: usize,      // byte-width of the return type (0 = void)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -130,7 +146,27 @@ const STR_MAX_CHARS: usize = 64;
 /// non-null, read the string from `proc` and return it formatted as
 /// `:"content"` (ANSI) or `:L"content"` (wide), ready to be appended after
 /// the hex value.  Returns `None` for all other types.
+///
+/// Handled cases:
+/// - `CType::CharPtr`  — `char*` / `const char*` parsed directly from headers
+/// - `CType::WCharPtr` — `wchar_t*` / `const wchar_t*` parsed directly
+/// - `CType::Named`    — Windows string-typedef aliases (`LPCSTR`, `LPWSTR`, …)
+///                       that survived typedef resolution as named types
 fn read_str_param(proc: HANDLE, ty: &CType, addr: usize) -> Option<String> {
+    match ty {
+        // ── Structural string types (emitted by the parser for raw char* / wchar_t*) ──
+        CType::CharPtr => {
+            let raw = read_cstr(proc, addr);
+            return Some(format!(":\"{}\"", sanitize_str(&raw)));
+        }
+        CType::WCharPtr => {
+            let raw = read_wstr(proc, addr);
+            return Some(format!(":L\"{}\"", sanitize_str(&raw)));
+        }
+        _ => {}
+    }
+
+    // ── Named string-typedef aliases ─────────────────────────────────────────
     let name = match ty {
         CType::Named(n) => n.as_str(),
         _ => return None,
@@ -145,6 +181,17 @@ fn read_str_param(proc: HANDLE, ty: &CType, addr: usize) -> Option<String> {
             Some(format!(":L\"{}\"", sanitize_str(&raw)))
         }
         _ => None,
+    }
+}
+
+/// Format a return value for the CSV `retval` column.
+fn format_retval(rax: u64, ret_size: usize) -> String {
+    match ret_size {
+        0 => "void".to_owned(),
+        1 => format!("{:#04x}", rax as u8),
+        2 => format!("{:#06x}", rax as u16),
+        4 => format!("{:#010x}", rax as u32),
+        _ => format!("{:#018x}", rax),
     }
 }
 
@@ -186,6 +233,45 @@ fn read_image_name(proc: HANDLE, lp_image_name: *mut std::ffi::c_void, f_unicode
     basename(&full).to_owned()
 }
 
+/// Reliably resolve the name of a module from a debug event.
+///
+/// Strategy (most-reliable first):
+///   1. `GetFinalPathNameByHandleW(hFile)` — works for any DLL with a valid
+///      file handle, including system DLLs loaded at process init.
+///   2. `lpImageName` double-pointer — often NULL for early-loaded DLLs.
+///   3. `"<unknown>"` — last resort.
+///
+/// Only the basename (e.g. `"kernel32.dll"`) is returned.
+fn resolve_module_name(
+    file_handle: HANDLE,
+    proc_handle: HANDLE,
+    lp_image_name: *mut std::ffi::c_void,
+    f_unicode: u16,
+) -> String {
+    // ── Attempt 1: GetFinalPathNameByHandleW ──────────────────────────────────
+    if is_valid_handle(file_handle) {
+        let mut buf = vec![0u16; 1024];
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                file_handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                0, // FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+            )
+        };
+        if n > 0 && (n as usize) < buf.len() {
+            let path = String::from_utf16_lossy(&buf[..n as usize]);
+            // Strip "\\?\" extended-length prefix when present.
+            let path = path.strip_prefix("\\\\?\\").unwrap_or(&path);
+            if !path.is_empty() {
+                return basename(path).to_owned();
+            }
+        }
+    }
+    // ── Attempt 2: lpImageName double-pointer ─────────────────────────────────
+    read_image_name(proc_handle, lp_image_name, f_unicode)
+}
+
 // ── DLL name filter ───────────────────────────────────────────────────────────
 
 /// Returns `true` if `target` (the name stored in the breakpoint table, e.g.
@@ -194,9 +280,11 @@ fn read_image_name(proc: HANDLE, lp_image_name: *mut std::ffi::c_void, f_unicode
 /// or absence of the `.dll` extension on either side.
 fn dll_name_matches(target: &str, filter: &str) -> bool {
     fn strip_ext(s: &str) -> &str {
-        s.strip_suffix(".dll")
-            .or_else(|| s.strip_suffix(".DLL"))
-            .unwrap_or(s)
+        if s.len() >= 4 && s[s.len() - 4..].eq_ignore_ascii_case(".dll") {
+            &s[..s.len() - 4]
+        } else {
+            s
+        }
     }
     strip_ext(target).eq_ignore_ascii_case(strip_ext(filter))
 }
@@ -222,7 +310,24 @@ pub struct Debugger {
     /// case-insensitive; it is matched against `"dllbase.funcname"` first,
     /// then against `"funcname"` alone (for patterns with no dll prefix).
     excluded: Vec<Regex>,
+    /// Inclusion patterns.  A function that matches any of these is always
+    /// hooked, even if it also matches an exclusion pattern.
+    /// Checked before `excluded` — inclusions win.
+    included: Vec<Regex>,
     db: HeaderDb,
+    /// When `true` the tracer hooks the IAT of the main EXE only (instead of
+    /// every DLL's entire EAT), and additionally hooks every function address
+    /// returned by `GetProcAddress` at runtime.
+    trace_iat: bool,
+    /// Pending GetProcAddress return hooks.
+    ///
+    /// Key:   `(pid, return_address_after_call_to_GetProcAddress)`
+    /// Value: `(dll_name, func_name)` derived from the call arguments.
+    ///
+    /// When the one-shot BP at the return address fires we read RAX (the
+    /// resolved function pointer) and call `set_bp` for `(dll_name, func_name)`.
+    gpa_pending: HashMap<(u32, usize), (String, String)>,
+    pending_returns: HashMap<(u32, usize), PendingReturn>,
 }
 
 impl Debugger {
@@ -236,7 +341,9 @@ impl Debugger {
         only_main: bool,
         dll_filter: Option<String>,
         excluded: Vec<Regex>,
+        included: Vec<Regex>,
         db: HeaderDb,
+        trace_iat: bool,
     ) -> Result<(Self, u32), String> {
         let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().collect();
         cmdline_w.push(0);
@@ -312,7 +419,11 @@ impl Debugger {
             only_main,
             dll_filter,
             excluded,
+            included,
             db,
+            trace_iat,
+            gpa_pending: HashMap::new(),
+            pending_returns: HashMap::new(),
         };
 
         Ok((dbg, pid))
@@ -320,20 +431,28 @@ impl Debugger {
 
     // ── Breakpoint management ─────────────────────────────────────────────────
 
-    /// Return `true` if this `(dll, function)` pair matches any exclusion pattern.
+    /// Return `true` if this `(dll, function)` pair should be skipped (not hooked).
     ///
-    /// Each pattern is tested against two strings (in order, short-circuiting):
-    ///   1. `"dllbase.funcname"` — dll with `.dll` suffix stripped, both lowercased
-    ///   2. `"funcname"` alone  — so bare-name patterns (no dll prefix) still work
+    /// Priority:
+    ///   1. Matches an **inclusion** pattern → always hook (return `false`)
+    ///   2. Matches an **exclusion** pattern → skip (return `true`)
+    ///   3. Neither                          → hook by default (return `false`)
+    ///
+    /// Each pattern is tested against two candidate strings:
+    ///   - `"dllbase.funcname"` (dll with .dll suffix stripped, both lowercased)
+    ///   - `"funcname"` alone (for bare-name patterns without a dll prefix)
     fn is_excluded(&self, dll: &str, func: &str) -> bool {
-        if self.excluded.is_empty() {
-            return false;
-        }
         let dl = dll.to_ascii_lowercase();
         let dl = dl.strip_suffix(".dll").unwrap_or(&dl);
         let fl = func.to_ascii_lowercase();
         let full = format!("{}.{}", dl, fl);
-        self.excluded.iter().any(|re| re.is_match(&full) || re.is_match(&fl))
+
+        let matches = |list: &[Regex]| list.iter().any(|re| re.is_match(&full) || re.is_match(&fl));
+
+        if !self.included.is_empty() && matches(&self.included) {
+            return false; // inclusion wins — always hook
+        }
+        !self.excluded.is_empty() && matches(&self.excluded)
     }
 
     fn set_bp(&mut self, pid: u32, addr: usize, target_image: String, target_routine: String) {
@@ -353,7 +472,43 @@ impl Debugger {
             None => return,
         };
         if write_byte(proc.handle, addr, 0xCC) {
-            proc.breakpoints.insert(addr, Bp { orig, target_image, target_routine });
+            proc.breakpoints.insert(addr, Bp { orig, target_image, target_routine, one_shot: false });
+        }
+    }
+
+    /// Place a breakpoint **without** checking exclusion patterns.
+    ///
+    /// Used internally for:
+    ///   - `GetProcAddress` itself (must always be hooked in `--trace-iat` mode
+    ///     regardless of user-supplied exclusion rules)
+    ///   - One-shot return-address hooks planted on `GetProcAddress` call sites
+    ///
+    /// Returns `true` if the breakpoint was successfully armed (or was already
+    /// present), `false` if the address could not be written.
+    fn set_raw_bp(
+        &mut self,
+        pid: u32,
+        addr: usize,
+        target_image: String,
+        target_routine: String,
+        one_shot: bool,
+    ) -> bool {
+        let proc = match self.procs.get_mut(&pid) {
+            Some(p) => p,
+            None => return false,
+        };
+        if proc.breakpoints.contains_key(&addr) {
+            return false; // already occupied — don't clobber
+        }
+        let orig = match read_u8(proc.handle, addr) {
+            Some(b) => b,
+            None => return false,
+        };
+        if write_byte(proc.handle, addr, 0xCC) {
+            proc.breakpoints.insert(addr, Bp { orig, target_image, target_routine, one_shot });
+            true
+        } else {
+            false
         }
     }
 
@@ -373,37 +528,91 @@ impl Debugger {
                 bp.orig,
                 bp.target_image.clone(),
                 bp.target_routine.clone(),
-                proc.handle,   // HANDLE is Copy
+                proc.handle, // HANDLE is Copy
                 proc.main_base,
                 proc.main_end,
             )
         };
-        
-        //println!("{}", target_routine);
+
         // Phase 2: get thread context and rewind RIP to the INT3 location.
         let mut ctx = make_context();
         if unsafe { GetThreadContext(thread_handle, &mut ctx.0) } == 0 {
             return;
         }
         ctx.0.Rip = bp_addr as u64;
-        ctx.0.EFlags |= 0x0100; // TF — single-step to re-arm after execution
+        ctx.0.EFlags |= 0x0100; // TF — single-step to re-arm (or remove) after execution
 
         let retaddr = read_u64(proc_handle, ctx.0.Rsp as usize).unwrap_or(0) as usize;
 
+        // Phase 2.5: one-shot function-return hook.
+        //
+        // BPs with `target_routine == "<fn-return>"` are planted on the return
+        // address of every intercepted call.  When one fires we:
+        //   (a) hook the function address that GetProcAddress just resolved, if
+        //       this was a GPA call (gpa_pending entry)
+        //   (b) emit the deferred log line with the captured return value (RAX)
+        if target_routine == "<fn-return>" {
+            let rax = ctx.0.Rax;
+
+            // (a) GPA interception: hook the resolved function address.
+            if let Some((gpa_dll, gpa_func)) = self.gpa_pending.remove(&(pid, bp_addr)) {
+                let resolved = rax as usize;
+                if resolved != 0 {
+                    eprintln!(
+                        "[+] GetProcAddress({}.{}) → {:#x} — hooking",
+                        gpa_dll, gpa_func, resolved
+                    );
+                    self.set_bp(pid, resolved, gpa_dll, gpa_func);
+                }
+            }
+
+            // (b) Return-value logging: emit the deferred log line.
+            if let Some(pr) = self.pending_returns.remove(&(pid, bp_addr)) {
+                let retval = format_retval(rax, pr.ret_size);
+                let line = format!(
+                    "{}.{:06},{},{},{:#x},{},{:#x},{},{},{},{}",
+                    pr.ts_sec, pr.ts_usec,
+                    pid,
+                    pr.tid,
+                    bp_addr,        // = original retaddr
+                    pr.caller_image,
+                    pr.bp_addr,     // = original hooked-function address
+                    pr.target_image,
+                    pr.target_routine,
+                    pr.params_str,
+                    retval,
+                );
+                if let Some(tx) = &self.log_tx {
+                    let _ = tx.send(line);
+                }
+            }
+
+            write_byte(proc_handle, bp_addr, orig);
+            unsafe { SetThreadContext(thread_handle, &ctx.0) };
+            self.rearm.insert(thread_id, bp_addr);
+            return;
+        }
+
         // Phase 3: log (if within scope).
         let caller_ok = !self.only_main || (retaddr >= main_base && retaddr < main_end);
-        let dll_ok = self.dll_filter.as_deref()
-            .map(|f| dll_name_matches(&target_image, f))
-            .unwrap_or(true);
-        if caller_ok && dll_ok {
-            // Resolve caller module name — brief second borrow of procs.
-            let caller_image = self.procs
-                .get(&pid)
-                .and_then(|p| module_at(&p.modules, retaddr))
-                .map(|m| m.name.clone())
-                .unwrap_or_default();
 
-            // Format parameters — borrows self.db only.
+        // Resolve caller module name unconditionally — needed for the dll_filter
+        // check below (--dll now filters on the *caller* side, not the target).
+        let caller_image = self.procs
+            .get(&pid)
+            .and_then(|p| module_at(&p.modules, retaddr))
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+
+        let dll_ok = self.dll_filter.as_deref()
+            .map(|f| dll_name_matches(&caller_image, f))
+            .unwrap_or(true);
+
+        if caller_ok && dll_ok {
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+            let ts_sec  = ts.as_secs();
+            let ts_usec = ts.subsec_micros();
+
             let params_str = self
                 .db
                 .functions
@@ -421,25 +630,91 @@ impl Debugger {
                     )
                 });
 
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default();
-            let line = format!(
-                "{}.{:06},{},{},{:#x},{},{:#x},{},{},{}",
-                ts.as_secs(),
-                ts.subsec_micros(),
-                pid,
-                thread_id,
-                retaddr,
-                caller_image,
-                bp_addr,
-                target_image,
-                target_routine,
-                params_str,
-            );
-            if let Some(tx) = &self.log_tx {
-                let _ = tx.send(line);
+            let ret_size = self
+                .db
+                .functions
+                .get(&target_routine)
+                .map(|def| def.ret.size_x64(&self.db.typedefs))
+                .unwrap_or(8);
+
+            // Attempt to defer logging until the function returns so we can
+            // capture RAX (the return value) and include it in the log line.
+            // Falls back to immediate logging (retval=?) when:
+            //   - retaddr is 0 (no valid return site)
+            //   - another deferred call is already waiting at the same (pid, retaddr)
+            //   - the return address is already occupied by a persistent hook
+            let slot_key = (pid, retaddr);
+            let already_pending = self.pending_returns.contains_key(&slot_key);
+            let deferred = retaddr != 0
+                && !already_pending
+                && self.set_raw_bp(
+                    pid, retaddr,
+                    String::new(), "<fn-return>".to_owned(),
+                    true, // one_shot
+                );
+
+            if deferred {
+                self.pending_returns.insert(slot_key, PendingReturn {
+                    ts_sec,
+                    ts_usec,
+                    tid: thread_id,
+                    caller_image: caller_image.clone(),
+                    bp_addr,
+                    target_image: target_image.clone(),
+                    target_routine: target_routine.clone(),
+                    params_str,
+                    ret_size,
+                });
+            } else {
+                let line = format!(
+                    "{}.{:06},{},{},{:#x},{},{:#x},{},{},{},?",
+                    ts_sec, ts_usec,
+                    pid, thread_id,
+                    retaddr, caller_image,
+                    bp_addr, target_image, target_routine,
+                    params_str,
+                );
+                if let Some(tx) = &self.log_tx {
+                    let _ = tx.send(line);
+                }
             }
+        }
+
+        // Phase 3.5: if this call was to GetProcAddress and we are in --trace-iat
+        // mode, ensure a one-shot return hook is in place so we can intercept
+        // the resolved address and hook it before the caller uses it.
+        // Phase 3 may have already planted a <fn-return> BP at retaddr; if so,
+        // we reuse it — just record the pending GPA context.
+        if self.trace_iat && target_routine == "GetProcAddress" && retaddr != 0 {
+            let hmodule  = ctx.0.Rcx as usize;
+            let lp_name  = ctx.0.Rdx;
+
+            let dll_name: String = self.procs
+                .get(&pid)
+                .and_then(|p| module_at(&p.modules, hmodule))
+                .map(|m| m.name.clone())
+                .unwrap_or_default();
+
+            let func_name: String = if lp_name >> 16 == 0 {
+                format!("#{}", lp_name & 0xFFFF)
+            } else {
+                read_cstr(proc_handle, lp_name as usize)
+            };
+
+            // Plant a <fn-return> BP only if Phase 3 hasn't already done so.
+            let bp_already = self.procs
+                .get(&pid)
+                .map(|p| p.breakpoints.contains_key(&retaddr))
+                .unwrap_or(false);
+            if !bp_already {
+                self.set_raw_bp(
+                    pid, retaddr,
+                    String::new(), "<fn-return>".to_owned(),
+                    true, // one_shot
+                );
+            }
+            // Always record — the <fn-return> handler hooks the resolved address.
+            self.gpa_pending.insert((pid, retaddr), (dll_name, func_name));
         }
 
         // Phase 4: restore original byte and arm single-step.
@@ -450,11 +725,24 @@ impl Debugger {
 
     fn handle_single_step(&mut self, pid: u32, tid: u32, thread_handle: HANDLE) {
         if let Some(addr) = self.rearm.remove(&tid) {
-            let proc_handle = match self.procs.get(&pid) {
-                Some(p) => p.handle,
-                None => return,
+            // Determine whether this BP should be re-armed or permanently removed.
+            let (proc_handle, one_shot) = {
+                let proc = match self.procs.get(&pid) { Some(p) => p, None => return };
+                let one_shot = proc.breakpoints.get(&addr)
+                    .map(|bp| bp.one_shot)
+                    .unwrap_or(false);
+                (proc.handle, one_shot)
             };
-            write_byte(proc_handle, addr, 0xCC);
+
+            if one_shot {
+                // Remove the one-shot BP from the table; don't write 0xCC back.
+                if let Some(proc) = self.procs.get_mut(&pid) {
+                    proc.breakpoints.remove(&addr);
+                }
+            } else {
+                write_byte(proc_handle, addr, 0xCC);
+            }
+
             let mut ctx = make_context();
             if unsafe { GetThreadContext(thread_handle, &mut ctx.0) } != 0 {
                 ctx.0.EFlags &= !0x0100u32;
@@ -480,39 +768,72 @@ impl Debugger {
         }
     }
 
+    /// Place an INT3 on the PE entry point of the module at `base`.
+    ///
+    /// `ep_name` is what will appear in the `target_routine` CSV column:
+    ///   - `"<entrypoint>"` for executables
+    ///   - `"DllMain"`      for DLLs
+    ///
+    /// No-ops silently when the entry point RVA is zero (resource-only DLLs).
+    fn hook_entry_point(&mut self, pid: u32, base: usize, module_name: &str, ep_name: &str) {
+        let proc_handle = match self.procs.get(&pid) {
+            Some(p) => p.handle,
+            None => return,
+        };
+        if let Some(ep_addr) = get_entry_point(proc_handle, base) {
+            self.set_bp(pid, ep_addr, module_name.to_owned(), ep_name.to_owned());
+        }
+    }
+
     // ── Module tracking ───────────────────────────────────────────────────────
 
     fn add_module_from_create(&mut self, pid: u32, info: &CREATE_PROCESS_DEBUG_INFO) {
-        let handle = info.hProcess;
-        let base = info.lpBaseOfImage as usize;
-        let size = get_module_size(handle, base);
-        let name = read_image_name(handle, info.lpImageName, info.fUnicode);
+        let handle = info.hProcess; // HANDLE is Copy — safe to use after insert
+        let base   = info.lpBaseOfImage as usize;
+        let size   = get_module_size(handle, base);
+        let name   = resolve_module_name(info.hFile, handle, info.lpImageName, info.fUnicode);
+
         self.procs.insert(pid, ProcState {
             handle,
             modules: vec![ModInfo { base, end: base + size, name: name.clone() }],
             main_base: base,
-            main_end: base + size,
+            main_end:  base + size,
             breakpoints: HashMap::new(),
             initial_bp_done: false,
         });
         // hFile can be NULL for kernel-mapped images (e.g. ntdll) — guard before closing.
         if is_valid_handle(info.hFile) { unsafe { CloseHandle(info.hFile) }; }
-        // Hook any exports from the main executable (usually none for regular apps).
-        self.hook_exports(pid, base, &name);
+
+        if self.trace_iat {
+            // --trace-iat: hook every function the EXE imports through its IAT.
+            // `handle` is Copy and still valid; `parse_imports` doesn't borrow self.
+            let imports = parse_imports(handle, base);
+            let count = imports.len();
+            for imp in imports {
+                self.set_bp(pid, imp.addr, imp.dll, imp.name);
+            }
+            if count > 0 {
+                eprintln!("[+] PID {} — {} IAT hook(s) from {}", pid, count, name);
+            }
+        } else {
+            // Default: hook every named export from the EXE (usually none).
+            self.hook_exports(pid, base, &name);
+        }
+
+        // Always hook the EXE entry point regardless of mode.
+        self.hook_entry_point(pid, base, &name, "<entrypoint>");
     }
 
     fn add_module_from_load(&mut self, pid: u32, info: &LOAD_DLL_DEBUG_INFO) {
         // Phase 1: read all values we need while the immutable borrow is live.
         // HANDLE is Copy so we can extract it without keeping a reference to ProcState.
-        let (base, size, name) = {
-            let proc = match self.procs.get(&pid) {
-                Some(p) => p,
-                None => return,
-            };
+        let (base, size, name, ep_addr) = {
+            let proc = match self.procs.get(&pid) { Some(p) => p, None => return };
             let base = info.lpBaseOfDll as usize;
             let size = get_module_size(proc.handle, base);
-            let name = read_image_name(proc.handle, info.lpImageName, info.fUnicode);
-            (base, size, name)
+            let name = resolve_module_name(info.hFile, proc.handle, info.lpImageName, info.fUnicode);
+            let ep_addr = get_entry_point(proc.handle, base);
+            (base, size, name, ep_addr)
         }; // immutable borrow released here
 
         // Phase 2: push the new module info into the module list.
@@ -523,8 +844,50 @@ impl Debugger {
         // hFile can be NULL for in-memory or kernel-backed DLLs.
         if is_valid_handle(info.hFile) { unsafe { CloseHandle(info.hFile) }; }
 
-        // Phase 3: hook all named exports of the newly loaded DLL.
-        self.hook_exports(pid, base, &name);
+        if self.trace_iat {
+            // --trace-iat: don't hook EAT exports of this DLL.
+            // Exception: GetProcAddress in kernel32 / kernelbase must always be
+            // hooked so we can intercept dynamic resolution at runtime.
+            let lc = name.to_ascii_lowercase();
+            if lc == "kernel32.dll" || lc == "kernelbase.dll" {
+                self.hook_gpa(pid, base, &name);
+            }
+        } else {
+            // Default: hook all named exports.
+            self.hook_exports(pid, base, &name);
+        }
+
+        // Always hook DllMain regardless of mode.
+        if let Some(addr) = ep_addr {
+            self.set_bp(pid, addr, name.clone(), "DllMain".to_owned());
+        }
+    }
+
+    /// Scan the EAT of the DLL at `base` for `GetProcAddress` and arm an
+    /// unconditional (exclusion-bypassing) INT3 on it.
+    ///
+    /// Called in `--trace-iat` mode when kernel32.dll or kernelbase.dll loads,
+    /// so that every subsequent `GetProcAddress` call can be intercepted and
+    /// the resolved address hooked before the caller uses it.
+    fn hook_gpa(&mut self, pid: u32, base: usize, module_name: &str) {
+        let proc_handle = match self.procs.get(&pid) { Some(p) => p.handle, None => return };
+        // parse_exports doesn't borrow self, proc_handle is Copy.
+        let exports = parse_exports(proc_handle, base);
+        for exp in &exports {
+            if exp.name == "GetProcAddress" {
+                eprintln!(
+                    "[+] PID {} — hooking GetProcAddress @ {:#x} ({})",
+                    pid, exp.addr, module_name
+                );
+                // set_raw_bp bypasses is_excluded — GPA must always be hooked.
+                self.set_raw_bp(
+                    pid, exp.addr,
+                    module_name.to_owned(), "GetProcAddress".to_owned(),
+                    false, // not one-shot: stays armed for every call
+                );
+                break;
+            }
+        }
     }
 
     // ── Main debug event loop ─────────────────────────────────────────────────

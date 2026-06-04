@@ -158,6 +158,7 @@ GetLastError
 GetCurrentProcessId
 RtlSetLastWin32Error
 InitializeCriticalSectionEx
+FlsGetValue
 
 # CRT allocatori e stdlib (molto chiamati da COM internamente)
 malloc

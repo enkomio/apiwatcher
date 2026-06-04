@@ -8,6 +8,9 @@ pub struct Bp {
     pub orig: u8,
     pub target_image: String,
     pub target_routine: String,
+    /// When `true` the breakpoint is removed after it fires once instead of
+    /// being re-armed.  Used for GetProcAddress return hooks.
+    pub one_shot: bool,
 }
 
 /// Newtype wrapper that forces the 16-byte alignment required by

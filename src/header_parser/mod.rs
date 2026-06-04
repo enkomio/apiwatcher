@@ -41,6 +41,10 @@ pub enum CType {
     Double,
     /// Any pointer — always 8 bytes on x64.
     Pointer,
+    /// `char*` / `const char*` — 8-byte pointer, printed as an ANSI string.
+    CharPtr,
+    /// `wchar_t*` / `const wchar_t*` — 8-byte pointer, printed as a UTF-16 string.
+    WCharPtr,
     /// Function pointer — treated as Pointer.
     FnPtr,
     /// Unresolved typedef or struct tag; looked up at size-query time.
@@ -55,7 +59,8 @@ impl CType {
             CType::Bool | CType::I8 | CType::U8 => 1,
             CType::I16 | CType::U16 => 2,
             CType::I32 | CType::U32 | CType::Float => 4,
-            CType::I64 | CType::U64 | CType::Double | CType::Pointer | CType::FnPtr => 8,
+            CType::I64 | CType::U64 | CType::Double
+            | CType::Pointer | CType::CharPtr | CType::WCharPtr | CType::FnPtr => 8,
             CType::Named(name) => typedefs
                 .get(name)
                 .map(|t| t.size_x64(typedefs))
@@ -74,6 +79,8 @@ impl CType {
             CType::U32 => "u32", CType::U64 => "u64",
             CType::Float => "float", CType::Double => "double",
             CType::Pointer | CType::FnPtr => "ptr",
+            CType::CharPtr  => "char*",
+            CType::WCharPtr => "wchar_t*",
             CType::Named(n) => n.as_str(),
         }
     }
@@ -177,15 +184,21 @@ impl HeaderDb {
         ins!("HFILE",     CType::Pointer);
         ins!("SC_HANDLE", CType::Pointer);
 
-        // String / pointer aliases
-        ins!("LPSTR",   CType::Pointer);
-        ins!("LPCSTR",  CType::Pointer);
-        ins!("LPWSTR",  CType::Pointer);
-        ins!("LPCWSTR", CType::Pointer);
-        ins!("PCWSTR",  CType::Pointer);
-        ins!("PSTR",    CType::Pointer);
-        ins!("PCSTR",   CType::Pointer);
-        ins!("PWSTR",   CType::Pointer);
+        // Narrow string pointer aliases → CharPtr (printed as ANSI strings)
+        ins!("LPSTR",    CType::CharPtr);
+        ins!("LPCSTR",   CType::CharPtr);
+        ins!("PSTR",     CType::CharPtr);
+        ins!("PCSTR",    CType::CharPtr);
+        ins!("LPCCH",    CType::CharPtr);
+        ins!("LPCH",     CType::CharPtr);
+
+        // Wide string pointer aliases → WCharPtr (printed as UTF-16 strings)
+        ins!("LPWSTR",   CType::WCharPtr);
+        ins!("LPCWSTR",  CType::WCharPtr);
+        ins!("PCWSTR",   CType::WCharPtr);
+        ins!("PWSTR",    CType::WCharPtr);
+        ins!("LPCOLESTR",CType::WCharPtr);
+        ins!("LPOLESTR", CType::WCharPtr);
 
         // Common pointer-to-scalar aliases
         ins!("PBOOL",   CType::Pointer);

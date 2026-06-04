@@ -27,6 +27,12 @@ fn is_modifier(s: &str) -> bool {
         | "WINAPI" | "APIENTRY" | "CALLBACK" | "PASCAL" | "NTAPI"
         | "STDAPICALLTYPE" | "STDMETHODCALLTYPE" | "CDECL" | "FASTCALL"
         | "__cdecl" | "__stdcall" | "__fastcall" | "__thiscall" | "__vectorcall"
+        // 16-bit compatibility / winsock macros
+        | "FAR" | "NEAR"
+        // Linkage specifiers
+        | "EXTERN_C" | "WINSOCK_API_LINKAGE"
+        // Common SAL-free parameter qualifiers (older SDK / winsock headers)
+        | "IN" | "OUT" | "OPTIONAL"
         // Inline / linkage
         | "__forceinline" | "__inline" | "inline" | "extern" | "static"
         | "auto" | "register" | "restrict" | "__restrict"
@@ -199,6 +205,10 @@ impl Parser {
                         | "DECLSPEC_NOINLINE" | "DECLSPEC_NORETURN" | "FORCEINLINE"
                         | "WINAPI_INLINE" => { self.eat(); }
 
+                        // 16-bit compat / winsock / older SDK qualifiers
+                        "FAR" | "NEAR" | "EXTERN_C" | "WINSOCK_API_LINKAGE"
+                        | "IN" | "OUT" | "OPTIONAL" => { self.eat(); }
+
                         // Compiler attributes
                         "__declspec" | "__attribute__" | "__attribute" => {
                             self.eat();
@@ -285,21 +295,42 @@ impl Parser {
         base.unwrap_or(CType::I32)
     }
 
-    /// Consume pointer stars (and cv-qualifiers between them).
+    /// Consume pointer stars (and cv-qualifiers / 16-bit compat keywords between them).
+    ///
+    /// When the first star is applied to a character base type the result is
+    /// narrowed to a string-pointer variant so that the tracer can dereference
+    /// and print the pointed-to text automatically:
+    ///   - `char *` / `const char *`    → `CType::CharPtr`
+    ///   - `wchar_t *` / `WCHAR *`      → `CType::WCharPtr`
     fn parse_ptr(&mut self, inner: CType) -> CType {
         let mut had_star = false;
         loop {
             match self.peek() {
                 Tok::Star => { self.eat(); had_star = true; }
                 Tok::Ident(s)
-                    if matches!(s.as_str(), "const" | "volatile" | "__restrict" | "restrict") =>
+                    if matches!(
+                        s.as_str(),
+                        "const" | "volatile" | "__restrict" | "restrict"
+                        // `FAR *` and `NEAR *` are common in winsock / win16-compat headers
+                        | "FAR" | "NEAR"
+                    ) =>
                 {
                     self.eat();
                 }
                 _ => break,
             }
         }
-        if had_star { CType::Pointer } else { inner }
+        if had_star {
+            match &inner {
+                // char* / signed char*  →  narrow string pointer
+                CType::I8 => CType::CharPtr,
+                // wchar_t* / WCHAR*  →  wide string pointer
+                CType::Named(n) if n == "wchar_t" || n == "WCHAR" => CType::WCharPtr,
+                _ => CType::Pointer,
+            }
+        } else {
+            inner
+        }
     }
 
     /// Parse `struct`/`union` keyword + optional tag + optional body `{…}`.
@@ -350,15 +381,87 @@ impl Parser {
 
     // ── Function / variable declaration ───────────────────────────────────────
 
+    /// Try to interpret the current position as a *typed API macro* call:
+    ///
+    /// ```text
+    /// MACRO_NAME ( ReturnType [, extra_args...] ) FunctionName (
+    /// ```
+    ///
+    /// This covers Windows patterns such as:
+    ///   `INTERNETAPI_(HINTERNET) InternetOpenA(`
+    ///   `INTERNETAPIX(BOOL, _Success_(...)) InternetCloseHandle(`
+    ///   `URLCACHEAPI_(DWORD) GetUrlCacheEntryInfoA(`
+    ///
+    /// **Call when `peek()` is `LParen`** (i.e. after the macro name has already
+    /// been consumed as the "return type").
+    ///
+    /// On success, returns `(embedded_return_type, function_name)` with the
+    /// parser positioned just before the function's opening `(`.
+    /// On failure, the parser position is restored to where it was on entry.
+    fn try_typed_api_macro(&mut self) -> Option<(CType, String)> {
+        let saved = self.pos;
+
+        // Consume the opening `(` of the macro argument list.
+        debug_assert!(matches!(self.peek(), Tok::LParen));
+        self.eat();
+
+        // The first argument is the embedded return type.
+        self.skip_modifiers();
+        let ret = self.parse_type_spec();
+        let ret = self.parse_ptr(ret);
+
+        // Skip the rest of the macro arguments (any extra args, SAL, …) until
+        // we close the matching `)`.  We already consumed the opening `(`, so
+        // start at depth 1.
+        let mut depth = 1i32;
+        loop {
+            match self.peek() {
+                Tok::Eof => { self.pos = saved; return None; }
+                Tok::LParen => { depth += 1; self.eat(); }
+                Tok::RParen => {
+                    depth -= 1;
+                    self.eat();
+                    if depth == 0 { break; }
+                }
+                _ => { self.eat(); }
+            }
+        }
+
+        // Skip any calling-convention / linkage modifiers between `)` and the name.
+        self.skip_modifiers();
+
+        // The next token must be the actual function name.
+        let func_name = match self.peek().clone() {
+            Tok::Ident(n) => { self.eat(); n }
+            _ => { self.pos = saved; return None; }
+        };
+
+        // …followed immediately by the function's parameter list `(`.
+        if !matches!(self.peek(), Tok::LParen) {
+            self.pos = saved;
+            return None;
+        }
+
+        Some((ret, func_name))
+    }
+
     fn parse_decl(&mut self) {
         let base = self.parse_type_spec();
         self.skip_modifiers();
-        let ret_ty = self.parse_ptr(base);
+        let mut ret_ty = self.parse_ptr(base);
         self.skip_modifiers();
 
         let name = match self.peek().clone() {
             Tok::Ident(n) => { self.eat(); n }
-            Tok::LParen => { self.skip_to_semi(); return; }
+            // A `(` here can mean two things:
+            //  (a) function-pointer return type  — skip and bail (no name available)
+            //  (b) typed API macro call: MACRO(RetType) FuncName(…)  — try to recover
+            Tok::LParen => {
+                match self.try_typed_api_macro() {
+                    Some((ty, n)) => { ret_ty = ty; n }
+                    None => { self.skip_to_semi(); return; }
+                }
+            }
             _ => { self.skip_to_semi(); return; }
         };
 
@@ -640,5 +743,155 @@ RtlDestroyHeap(
         let f = p.functions.get("VirtualFree").unwrap();
         assert_eq!(f.params.len(), 3);
         assert_eq!(f.params[0].name, "lpAddress");
+    }
+
+    // ── winsock / winsock2 style (TYPE PASCAL FAR FuncName) ───────────────────
+
+    #[test]
+    fn test_far_calling_conv() {
+        // winsock.h pattern: SOCKET PASCAL FAR accept(SOCKET, struct sockaddr FAR *, int FAR *);
+        let p = parse("typedef unsigned int SOCKET; SOCKET PASCAL FAR accept(SOCKET s, int FAR * addr, int FAR * addrlen);");
+        let f = p.functions.get("accept").expect("accept missing");
+        assert_eq!(f.params.len(), 3);
+        assert_eq!(f.params[0].name, "s");
+    }
+
+    #[test]
+    fn test_far_pointer_param() {
+        // char FAR * should resolve to CharPtr (not a generic Pointer)
+        let p = parse("int PASCAL FAR recv(int s, char FAR * buf, int len, int flags);");
+        let f = p.functions.get("recv").expect("recv missing");
+        assert_eq!(f.params.len(), 4);
+        assert_eq!(f.params[1].ty, CType::CharPtr); // char FAR * → CharPtr
+    }
+
+    #[test]
+    fn test_char_ptr_variants() {
+        // char*, const char*, char const* all → CharPtr
+        let p = parse("int foo(char* a, const char* b, char const* c);");
+        let f = p.functions.get("foo").expect("foo missing");
+        assert_eq!(f.params[0].ty, CType::CharPtr, "char*");
+        assert_eq!(f.params[1].ty, CType::CharPtr, "const char*");
+        assert_eq!(f.params[2].ty, CType::CharPtr, "char const*");
+    }
+
+    #[test]
+    fn test_wchar_ptr() {
+        // wchar_t* → WCharPtr
+        let p = parse("int bar(wchar_t* s, const wchar_t* t);");
+        let f = p.functions.get("bar").expect("bar missing");
+        assert_eq!(f.params[0].ty, CType::WCharPtr, "wchar_t*");
+        assert_eq!(f.params[1].ty, CType::WCharPtr, "const wchar_t*");
+    }
+
+    #[test]
+    fn test_winsock2_multiline() {
+        // winsock2.h pattern: WINSOCK_API_LINKAGE expands to __declspec(dllimport),
+        // WSAAPI expands to FAR PASCAL — both need to be modifiers.
+        let src = "
+#define WINSOCK_API_LINKAGE __declspec(dllimport)
+#define WSAAPI FAR PASCAL
+typedef unsigned int SOCKET;
+WINSOCK_API_LINKAGE
+SOCKET
+WSAAPI
+accept(
+    SOCKET s,
+    int FAR * addr,
+    int FAR * addrlen
+);
+";
+        let p = parse(src);
+        let f = p.functions.get("accept").expect("accept missing");
+        assert_eq!(f.params.len(), 3);
+    }
+
+    // ── WinInet typed-API-macro style (MACRO(RetType) FuncName) ──────────────
+
+    #[test]
+    fn test_typed_api_macro_simple() {
+        // INTERNETAPI_(HINTERNET) InternetOpenA(...)
+        // INTERNETAPI_ is function-like (skipped by preprocessor), stays as-is.
+        let src = "typedef void* HINTERNET; INTERNETAPI_(HINTERNET) InternetOpenA(int a, int b);";
+        let p = parse(src);
+        let f = p.functions.get("InternetOpenA").expect("InternetOpenA missing");
+        assert_eq!(f.params.len(), 2);
+    }
+
+    #[test]
+    fn test_typed_api_macro_with_sal() {
+        // BOOLAPI expands to INTERNETAPIX(BOOL, _Success_(return != FALSE))
+        // — the extra SAL arg must be skipped gracefully.
+        let src = "
+#define BOOLAPI INTERNETAPIX(BOOL,_Success_(return != FALSE))
+BOOLAPI InternetCloseHandle(int hInternet);
+";
+        let p = parse(src);
+        let f = p.functions.get("InternetCloseHandle").expect("InternetCloseHandle missing");
+        assert_eq!(f.params.len(), 1);
+    }
+
+    // ── Winsock / WinInet header integration tests ────────────────────────────
+
+    #[test]
+    fn test_sdk_winsock2_h() {
+        let path = std::path::Path::new("defs/winsock2.h");
+        if !path.exists() { return; }
+        use crate::header_parser::HeaderDb;
+        let mut db = HeaderDb::new();
+        db.load_file(path);
+        let mut found: Vec<_> = db.functions.keys().cloned().collect();
+        found.sort();
+        println!("winsock2 functions ({}):", found.len());
+        for n in &found { println!("  {}", n); }
+
+        for name in &["accept", "bind", "connect", "recv", "send", "socket",
+                       "WSAStartup", "WSACleanup", "WSAGetLastError"] {
+            assert!(db.functions.contains_key(*name),
+                "MISSING: {} — found: {:?}", name, found);
+        }
+    }
+
+    #[test]
+    fn test_sdk_winsock_h() {
+        let path = std::path::Path::new("defs/winsock.h");
+        if !path.exists() { return; }
+        use crate::header_parser::HeaderDb;
+        let mut db = HeaderDb::new();
+        db.load_file(path);
+        let mut found: Vec<_> = db.functions.keys().cloned().collect();
+        found.sort();
+        println!("winsock functions ({}):", found.len());
+        for n in &found { println!("  {}", n); }
+
+        for name in &["accept", "bind", "connect", "recv", "send", "socket"] {
+            assert!(db.functions.contains_key(*name),
+                "MISSING: {} — found: {:?}", name, found);
+        }
+    }
+
+    #[test]
+    fn test_sdk_wininet_h() {
+        let path = std::path::Path::new("defs/WinInet.h");
+        if !path.exists() { return; }
+        use crate::header_parser::HeaderDb;
+        let mut db = HeaderDb::new();
+        db.load_file(path);
+        let mut found: Vec<_> = db.functions.keys().cloned().collect();
+        found.sort();
+        println!("WinInet functions ({}):", found.len());
+        for n in &found { println!("  {}", n); }
+
+        for name in &[
+            "InternetOpenA", "InternetOpenW",
+            "InternetConnectA", "InternetConnectW",
+            "InternetCloseHandle",
+            "HttpOpenRequestA", "HttpOpenRequestW",
+            "HttpSendRequestA", "HttpSendRequestW",
+            "InternetReadFile",
+        ] {
+            assert!(db.functions.contains_key(*name),
+                "MISSING: {} — found: {:?}", name, found);
+        }
     }
 }
