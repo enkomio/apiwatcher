@@ -105,12 +105,18 @@ fn read_param_raw(proc: HANDLE, ctx: &CONTEXT, rsp: u64, index: usize) -> u64 {
 }
 
 /// Build the `params` CSV column for one function call.
+///
+/// `modules` is the list of modules loaded in the target process; it is used
+/// to annotate generic void-pointer parameters (`LPVOID` / `PVOID` /
+/// `LPCVOID`) with the name of the module that owns the address —
+/// e.g. `lpAddress=0x00007ff812340000:[kernel32.dll]`.
 pub fn format_params(
     proc: HANDLE,
     ctx: &CONTEXT,
     rsp: u64,
     def: &FunctionDef,
     typedefs: &HashMap<String, CType>,
+    modules: &[ModInfo],
 ) -> String {
     let mut out = String::new();
     for (i, param) in def.params.iter().enumerate() {
@@ -129,9 +135,12 @@ pub fn format_params(
         out.push('=');
         out.push_str(&hex);
 
-        // For non-null string pointer types, append the dereferenced content.
         if raw != 0 {
             if let Some(extra) = read_str_param(proc, &param.ty, raw as usize) {
+                // String pointer — append dereferenced content.
+                out.push_str(&extra);
+            } else if let Some(extra) = try_module_annotation(modules, &param.ty, raw as usize) {
+                // Generic void pointer whose value falls inside a known module.
                 out.push_str(&extra);
             }
         }
@@ -141,6 +150,23 @@ pub fn format_params(
 
 /// Maximum number of characters printed for string arguments.
 const STR_MAX_CHARS: usize = 64;
+
+/// If `ty` is a generic void-pointer alias (`LPVOID`, `PVOID`, `LPCVOID`) and
+/// `addr` falls within a known module, return `":[modulename]"` to be appended
+/// after the hex value.  Returns `None` for typed or opaque pointers and for
+/// addresses that don't belong to any tracked module.
+fn try_module_annotation(modules: &[ModInfo], ty: &CType, addr: usize) -> Option<String> {
+    let name = match ty {
+        CType::Named(n) => n.as_str(),
+        _ => return None,
+    };
+    match name {
+        "LPVOID" | "PVOID" | "LPCVOID" => {
+            module_at(modules, addr).map(|m| format!(":[{}]", m.name))
+        }
+        _ => None,
+    }
+}
 
 /// If `ty` is a recognised ANSI or wide string pointer type and `addr` is
 /// non-null, read the string from `proc` and return it formatted as
@@ -613,12 +639,19 @@ impl Debugger {
             let ts_sec  = ts.as_secs();
             let ts_usec = ts.subsec_micros();
 
+            // Borrow modules for void-pointer annotation; the borrow ends as
+            // soon as format_params returns (NLL), before any mutable self use.
+            let modules_slice: &[ModInfo] = self.procs
+                .get(&pid)
+                .map(|p| p.modules.as_slice())
+                .unwrap_or(&[]);
+
             let params_str = self
                 .db
                 .functions
                 .get(&target_routine)
                 .map(|def| {
-                    format_params(proc_handle, &ctx.0, ctx.0.Rsp, def, &self.db.typedefs)
+                    format_params(proc_handle, &ctx.0, ctx.0.Rsp, def, &self.db.typedefs, modules_slice)
                 })
                 .unwrap_or_else(|| {
                     format!(
