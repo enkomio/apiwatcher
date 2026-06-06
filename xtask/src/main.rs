@@ -163,7 +163,7 @@ fn dist() {
     }
 
     // Flat files
-    for name in &["exclusions.txt", "inclusions.txt", "README.md"] {
+    for name in &["exclusions.txt", "inclusions.txt"] {
         let src = root.join(name);
         if src.is_file() {
             zip_file(&mut writer, &src, &format!("{}{}", top, name), opts);

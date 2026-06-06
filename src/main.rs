@@ -143,6 +143,15 @@ fn build_patterns(patterns: &[String], file: Option<&str>, label: &str) -> Vec<R
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
+    eprint!(r#"
+  __ _ _ __ (_)__      __  __ _  _      ___  _       ___  _ __
+ / _` | '_ \(_)\ \ /\ / / / _` || |_   / __|| |_    / _ \| '__|
+| (_| || |_) || | \ V  V / | (_| || __|  (__| '_ \|  __/| |
+ \__,_|| .__/ |_|  \_/\_/   \__,_||_|   \___|_| |_| \___|_|
+        |_|                                    |_| |_|
+"#);
+    eprintln!(" v{}  |  Windows API call tracer\n", env!("CARGO_PKG_VERSION"));
+
     let args = Args::parse();
 
     // Build the full command-line string expected by CreateProcessW.
