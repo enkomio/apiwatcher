@@ -1,0 +1,45 @@
+# Default inclusion patterns — these functions are always hooked regardless of
+# any exclusion rule that also matches them.
+#
+# Syntax: case-insensitive anchored regex, tested against:
+#   1. "dllbasename.funcname"  (e.g. kernel32.CreateFileW)
+#   2. "funcname"              (e.g. CreateFileW)
+#
+#   dllname\..*      — all exports from a specific DLL
+#   FuncName.*       — function name prefix, matches any DLL
+#   dllname\.Func.*  — prefix match scoped to one DLL
+#
+# Lines starting with # and blank lines are ignored.
+# A bare * is shorthand for .* (match everything).
+
+# ── Dynamic code loading ──────────────────────────────────────────────────────
+
+# LoadLibraryA / LoadLibraryW / LoadLibraryExA / LoadLibraryExW
+LoadLibrary.*
+
+# GetProcAddress (no A/W variants)
+GetProcAddress
+
+# ── Synchronisation primitives ────────────────────────────────────────────────
+
+# CreateMutexA / CreateMutexW / CreateMutexExA / CreateMutexExW
+CreateMutex.*
+
+# ── File I/O ──────────────────────────────────────────────────────────────────
+
+# CreateFileA / CreateFileW / CreateFile2 / CreateFileTransactedA/W
+CreateFile.*
+
+# WriteFile / WriteFileEx / WriteFileGather / WriteFileTransacted
+WriteFile.*
+
+# ── Network — WinHTTP ─────────────────────────────────────────────────────────
+
+# All exports from winhttp.dll (WinHttpOpen, WinHttpConnect, WinHttpSendRequest, …)
+# Using the DLL-qualified pattern avoids false positives on bare function names.
+winhttp\..*
+
+# ── Cryptography — BCrypt ─────────────────────────────────────────────────────
+
+# All exports from bcrypt.dll (BCryptEncrypt, BCryptDecrypt, BCryptHashData, …)
+bcrypt\..*
