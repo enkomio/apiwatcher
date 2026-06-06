@@ -468,17 +468,14 @@ impl Parser {
         match self.peek() {
             Tok::LParen => {
                 self.eat();
-                let (params, variadic) = self.parse_param_list();
+                let params = self.parse_param_list();
                 self.skip_modifiers();
                 if matches!(self.peek(), Tok::LBrace) {
                     self.eat(); self.skip_braces();
                 } else {
                     self.expect_semi();
                 }
-                self.functions.insert(
-                    name.clone(),
-                    FunctionDef { name, ret: ret_ty, params, variadic },
-                );
+                self.functions.insert(name, FunctionDef { ret: ret_ty, params });
             }
             _ => { self.skip_to_semi(); }
         }
@@ -486,9 +483,8 @@ impl Parser {
 
     // ── Parameter list ────────────────────────────────────────────────────────
 
-    fn parse_param_list(&mut self) -> (Vec<Param>, bool) {
+    fn parse_param_list(&mut self) -> Vec<Param> {
         let mut params = Vec::new();
-        let mut variadic = false;
 
         loop {
             self.skip_modifiers();
@@ -497,7 +493,6 @@ impl Parser {
                 Tok::Eof     => break,
                 Tok::Ellipsis => {
                     self.eat();
-                    variadic = true;
                     if matches!(self.peek(), Tok::RParen) { self.eat(); }
                     break;
                 }
@@ -528,7 +523,7 @@ impl Parser {
 
                 // `(void)` → empty parameter list
                 if matches!(pty, CType::Void) && params.is_empty() {
-                    if matches!(self.peek(), Tok::RParen) { self.eat(); return (params, variadic); }
+                    if matches!(self.peek(), Tok::RParen) { self.eat(); return params; }
                 } else if !matches!(pty, CType::Void) || !params.is_empty() {
                     params.push(Param { name: pname, ty: pty });
                 }
@@ -541,7 +536,7 @@ impl Parser {
             }
         }
 
-        (params, variadic)
+        params
     }
 }
 

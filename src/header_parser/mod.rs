@@ -68,22 +68,6 @@ impl CType {
         }
     }
 
-    /// Human-readable type name for log output.
-    pub fn display(&self) -> &str {
-        match self {
-            CType::Void => "void",
-            CType::Bool => "bool",
-            CType::I8 => "i8", CType::I16 => "i16",
-            CType::I32 => "i32", CType::I64 => "i64",
-            CType::U8 => "u8", CType::U16 => "u16",
-            CType::U32 => "u32", CType::U64 => "u64",
-            CType::Float => "float", CType::Double => "double",
-            CType::Pointer | CType::FnPtr => "ptr",
-            CType::CharPtr  => "char*",
-            CType::WCharPtr => "wchar_t*",
-            CType::Named(n) => n.as_str(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +78,8 @@ pub struct Param {
 
 #[derive(Debug, Clone)]
 pub struct FunctionDef {
-    pub name: String,
     pub ret: CType,
     pub params: Vec<Param>,
-    pub variadic: bool,
 }
 
 // ── HeaderDb ──────────────────────────────────────────────────────────────────
