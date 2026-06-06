@@ -7,54 +7,21 @@ Spawns a target process under the debugger, hooks functions at the byte level wi
 
 ## Table of contents
 
-1. [How it works](#1-how-it-works)
+1. [Quick start](#1-quick-start)
 2. [Building](#2-building)
-3. [Quick start](#3-quick-start)
-4. [Command-line reference](#4-command-line-reference)
-5. [Hooking modes](#5-hooking-modes)
-6. [Output format](#6-output-format)
-7. [Exclusion patterns](#7-exclusion-patterns)
-8. [Inclusion patterns](#8-inclusion-patterns)
-9. [Pattern syntax](#9-pattern-syntax)
-10. [Function definitions (defs/)](#10-function-definitions-defs)
-11. [Default filter files](#11-default-filter-files)
-12. [Performance notes](#12-performance-notes)
+3. [Command-line reference](#3-command-line-reference)
+4. [Hooking modes](#4-hooking-modes)
+5. [Output format](#5-output-format)
+6. [Exclusion patterns](#6-exclusion-patterns)
+7. [Inclusion patterns](#7-inclusion-patterns)
+8. [Pattern syntax](#8-pattern-syntax)
+9. [Function definitions (defs/)](#9-function-definitions-defs)
+10. [Default filter files](#10-default-filter-files)
+11. [Performance notes](#11-performance-notes)
 
 ---
 
-## 1. How it works
-
-apiwatcher spawns the target with `CreateProcessW(DEBUG_PROCESS)` (child processes are also debugged) and handles debug events in a tight loop:
-
-| Event | Default (EAT) mode | `--trace-iat` mode |
-|---|---|---|
-| `CREATE_PROCESS_DEBUG_EVENT` | Hook every EAT export of the EXE + `<entrypoint>` | Hook every IAT import of the EXE + `<entrypoint>` |
-| `LOAD_DLL_DEBUG_EVENT` | Hook every EAT export of the DLL + `DllMain` | Hook `GetProcAddress` in kernel32/kernelbase + `DllMain` |
-| `EXCEPTION_BREAKPOINT` | Identify call, read context + params, restore byte, single-step to re-arm | Same |
-
-On each breakpoint hit the tracer:
-1. Rewinds `RIP` to the INT3 address and reads up to four arguments from registers / stack.
-2. Enqueues a formatted log line to a background writer thread.
-3. Restores the original byte, arms the hardware trace flag (TF) for single-step.
-4. On the subsequent single-step exception, re-arms the INT3 (or removes it if one-shot).
-
-A background thread drains the log queue in batches, keeping all disk I/O off the debug-event hot path.
-
----
-
-## 2. Building
-
-Requires Rust stable (2024 edition), targeting Windows x86-64.
-
-```
-cargo build --release
-```
-
-The binary is placed in `target\release\apiwatcher.exe`.
-
----
-
-## 3. Quick start
+## 1. Quick start
 
 ```
 # Trace all API calls — save to out.csv
@@ -63,8 +30,8 @@ apiwatcher -o out.csv -- notepad.exe
 # Trace only calls originating from the main executable image
 apiwatcher --only-main -o out.csv -- myapp.exe
 
-# Trace only calls made by kernel32 (caller-side filter)
-apiwatcher --dll kernel32 -o out.csv -- myapp.exe
+# Trace only calls made by a specific DLL (e.g. a hijacked DLL)
+apiwatcher --dll evil -o out.csv -- victim.exe
 
 # IAT mode: hook only what the EXE imports + dynamic GetProcAddress resolution
 apiwatcher --trace-iat -o out.csv -- myapp.exe
@@ -80,14 +47,26 @@ Always separate apiwatcher options from the target command with `--`.
 
 ---
 
-## 4. Command-line reference
+## 2. Building
+
+Requires Rust stable (2024 edition), targeting Windows x86-64.
+
+```
+cargo build --release
+```
+
+The binary is placed in `target\release\apiwatcher.exe`.
+
+---
+
+## 3. Command-line reference
 
 | Option | Default | Description |
 |---|---|---|
 | `-o`, `--output FILE` | `apiwatcher.csv` | CSV output file |
 | `--only-main` | off | Log only calls whose return address is inside the main EXE image |
-| `--dll NAME` | (all) | Log only calls whose **caller** image matches this name (case-insensitive, extension optional). Combined with `--only-main` via AND |
-| `--trace-iat` | off | IAT mode: hook only functions imported by the EXE's IAT, plus functions resolved at runtime by `GetProcAddress` (see [§5](#5-hooking-modes)) |
+| `--dll NAME` | (all) | Log only calls whose **caller** image matches this name (case-insensitive, extension optional). Combined with `--only-main` via AND. Useful when you want to trace the behaviour of a specific DLL rather than the whole process — for example when analysing malware that uses DLL search-order hijacking: pass the name of the hijacking DLL to see only the API calls it makes |
+| `--trace-iat` | off | IAT mode: hook only functions imported by the EXE's IAT, plus functions resolved at runtime by `GetProcAddress` (see [§4](#4-hooking-modes)) |
 | `--exclude PATTERN` | — | Exclude functions matching a regex. Repeatable |
 | `--exclude-file FILE` | `exclusions.txt`* | File with exclusion patterns, one per line |
 | `--include PATTERN` | — | Always hook functions matching a regex, overriding any exclusion. Repeatable |
@@ -98,7 +77,7 @@ Always separate apiwatcher options from the target command with `--`.
 
 ---
 
-## 5. Hooking modes
+## 4. Hooking modes
 
 ### Default mode — EAT hooking
 
@@ -126,12 +105,12 @@ The result is that any function the target resolves dynamically is hooked the mo
 
 ---
 
-## 6. Output format
+## 5. Output format
 
 UTF-8 CSV, one row per intercepted call:
 
 ```
-timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,params
+timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,params,retval
 ```
 
 | Column | Description |
@@ -144,11 +123,20 @@ timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,param
 | `bp_addr` | Address of the hooked function (hex) |
 | `target_image` | DLL (or EXE) that owns the function |
 | `target_routine` | Function name; `DllMain` for DLL entry points, `<entrypoint>` for the EXE entry point |
-| `params` | Space-separated `name=0xVALUE` pairs. String pointer types are dereferenced and shown as `:"text"` (ANSI) or `:L"text"` (wide). Falls back to `arg0…arg3` when no definition is available |
+| `params` | Space-separated `name=0xVALUE` pairs. See parameter annotations below. Falls back to `arg0…arg3` when no definition is available |
+| `retval` | Return value (`RAX`) formatted at the width of the declared return type. `?` when the return hook could not be planted |
+
+**Parameter annotations** — appended after the hex value when additional context is available:
+
+| Suffix | When | Example |
+|---|---|---|
+| `:"text"` | ANSI string pointer (`LPCSTR`, `char*`, …) | `lpFileName=0x000000a1b2c3d4e5:"C:\file.txt"` |
+| `:L"text"` | Wide string pointer (`LPCWSTR`, `wchar_t*`, …) | `lpFileName=0x000000a1b2c3d4e5:L"C:\file.txt"` |
+| `:[module.dll]` | Generic void pointer (`LPVOID`, `PVOID`, `LPCVOID`) whose value falls inside a known module | `lpAddress=0x00007ff812340000:[kernel32.dll]` |
 
 ---
 
-## 7. Exclusion patterns
+## 6. Exclusion patterns
 
 Functions that match an exclusion pattern are **never hooked** — no INT3 is placed, so they carry zero runtime overhead.
 
@@ -163,11 +151,11 @@ apiwatcher --exclude ".*Alloc.*" -- target.exe
 apiwatcher --exclude-file myfilters.txt -- target.exe
 ```
 
-If neither `--exclude` nor `--exclude-file` is given, `exclusions.txt` in the current directory is loaded automatically (see [§11](#11-default-filter-files)).
+If neither `--exclude` nor `--exclude-file` is given, `exclusions.txt` in the current directory is loaded automatically (see [§10](#10-default-filter-files)).
 
 ---
 
-## 8. Inclusion patterns
+## 7. Inclusion patterns
 
 Inclusion patterns **override exclusions**: a function that matches an inclusion is always hooked, regardless of any exclusion that also matches it.
 
@@ -192,7 +180,7 @@ Inclusions can also be loaded from a file with `--include-file`. The format is i
 
 ---
 
-## 9. Pattern syntax
+## 8. Pattern syntax
 
 Both exclusion and inclusion patterns are **case-insensitive, anchored regular expressions**.  
 Each pattern is compiled as `(?i)^(?:PATTERN)$` and tested against two strings, in order:
@@ -218,11 +206,15 @@ Each pattern is compiled as `(?i)^(?:PATTERN)$` and tested against two strings, 
 
 ---
 
-## 10. Function definitions (defs/)
+## 9. Function definitions (defs/)
 
 apiwatcher decodes call parameters when a matching function definition is available. Definitions are plain C header files in the `defs/` directory (configurable via `--defs`).
 
-Each file should contain standard C function prototypes. The parser handles common Win32 patterns including SAL annotations, `__declspec`, calling-convention macros (`WINAPI`, `PASCAL`, `FAR`, …), and Windows 16-bit compatibility keywords. It follows `typedef` chains to determine the size of each argument. String pointer types (`LPCSTR`, `LPCWSTR`, `PCWSTR`, …) are automatically dereferenced and their content appended after the pointer value.
+Each file should contain standard C function prototypes. The parser handles common Win32 patterns including SAL annotations, `__declspec`, calling-convention macros (`WINAPI`, `PASCAL`, `FAR`, …), and Windows 16-bit compatibility keywords. It follows `typedef` chains to determine the size of each argument.
+
+Parameter values are automatically annotated (see [§5](#5-output-format)):
+- **String pointers** (`LPCSTR`, `char*`, `LPCWSTR`, `wchar_t*`, …) — dereferenced and shown inline as `:"text"` or `:L"text"`.
+- **Generic void pointers** (`LPVOID`, `PVOID`, `LPCVOID`) — annotated with the owning module when the address falls inside a known DLL or EXE (`:[kernel32.dll]`).
 
 **Bundled definition files:**
 
@@ -241,7 +233,7 @@ To add definitions for other functions, drop a `.h` file with standard C prototy
 
 ---
 
-## 11. Default filter files
+## 10. Default filter files
 
 When the explicit `--exclude-file` / `--include-file` options are not given, apiwatcher checks for the corresponding default files in the **current working directory**:
 
@@ -250,7 +242,7 @@ When the explicit `--exclude-file` / `--include-file` options are not given, api
 | `exclusions.txt` | Functions to never hook |
 | `inclusions.txt` | Functions to always hook (override exclusions) |
 
-Both files use the regex format described in [§9](#9-pattern-syntax).
+Both files use the regex format described in [§8](#8-pattern-syntax).
 
 The bundled `exclusions.txt` covers categories that produce extremely high call volumes with little diagnostic value:
 
@@ -271,7 +263,7 @@ To exclude an entire DLL add: `mydll\..*`
 
 ---
 
-## 12. Performance notes
+## 11. Performance notes
 
 - **Hook placement** happens at module-load time, not on every call. The number of exclusion/inclusion patterns affects startup speed only.
 - **IAT mode** (`--trace-iat`) places far fewer breakpoints than EAT mode (tens vs. thousands) and is much less intrusive for targets with many loaded DLLs. Prefer it when you care about what the application calls rather than what libraries export.
