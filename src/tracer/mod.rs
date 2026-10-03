@@ -10,7 +10,7 @@ mod process;
 pub use breakpoint::{Bp, make_context};
 pub use pe::get_module_size;
 use pe::{get_entry_point, parse_exports, parse_imports};
-pub use process::{basename, read_cstr, read_u32, read_u64, read_u8, read_wstr, write_byte};
+pub use process::{basename, read_bytes, read_cstr, read_u32, read_u64, read_u8, read_wstr, write_byte};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -117,6 +117,7 @@ pub fn format_params(
     def: &FunctionDef,
     typedefs: &HashMap<String, CType>,
     modules: &[ModInfo],
+    hex_bytes: usize,
 ) -> String {
     let mut out = String::new();
     for (i, param) in def.params.iter().enumerate() {
@@ -137,10 +138,10 @@ pub fn format_params(
 
         if raw != 0 {
             if let Some(extra) = read_str_param(proc, &param.ty, raw as usize) {
-                // String pointer — append dereferenced content.
                 out.push_str(&extra);
             } else if let Some(extra) = try_module_annotation(modules, &param.ty, raw as usize) {
-                // Generic void pointer whose value falls inside a known module.
+                out.push_str(&extra);
+            } else if let Some(extra) = try_hex_dump(proc, &param.ty, raw as usize, hex_bytes) {
                 out.push_str(&extra);
             }
         }
@@ -166,6 +167,39 @@ fn try_module_annotation(modules: &[ModInfo], ty: &CType, addr: usize) -> Option
         }
         _ => None,
     }
+}
+
+/// Returns `true` for parameter types that are worth hex-dumping.
+fn is_hex_dumpable(ty: &CType) -> bool {
+    match ty {
+        CType::Named(n) => matches!(
+            n.as_str(),
+            "LPBYTE" | "PBYTE" | "PUCHAR" | "LPVOID" | "PVOID" | "LPCVOID"
+        ),
+        CType::Pointer => true,
+        _ => false,
+    }
+}
+
+/// If `ty` is a buffer type and `addr` is non-null, read up to `max_bytes` bytes
+/// from the target process and return them formatted as `:{xx xx xx …}`.
+/// Returns `None` when the feature is disabled (`max_bytes == 0`), the type is
+/// not a buffer, or the read fails.
+fn try_hex_dump(proc: HANDLE, ty: &CType, addr: usize, max_bytes: usize) -> Option<String> {
+    if max_bytes == 0 || !is_hex_dumpable(ty) {
+        return None;
+    }
+    let mut buf = vec![0u8; max_bytes];
+    let n = read_bytes(proc, addr, &mut buf);
+    if n == 0 {
+        return None;
+    }
+    let hex = buf[..n]
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(format!(":{{{}}}", hex))
 }
 
 /// If `ty` is a recognised ANSI or wide string pointer type and `addr` is
@@ -354,6 +388,14 @@ pub struct Debugger {
     /// resolved function pointer) and call `set_bp` for `(dll_name, func_name)`.
     gpa_pending: HashMap<(u32, usize), (String, String)>,
     pending_returns: HashMap<(u32, usize), PendingReturn>,
+    /// Number of bytes to hex-dump for buffer-type parameters.  0 = disabled.
+    hex_bytes: usize,
+    /// Maximum number of times a function may be intercepted before its
+    /// breakpoint is permanently removed.  0 = unlimited.
+    max_calls: u32,
+    /// Hit counter per breakpoint: `(pid, bp_addr)` → number of times the BP
+    /// has fired so far.  Cleaned up when the BP is removed.
+    call_counts: HashMap<(u32, usize), u32>,
 }
 
 impl Debugger {
@@ -370,6 +412,8 @@ impl Debugger {
         included: Vec<Regex>,
         db: HeaderDb,
         trace_iat: bool,
+        max_calls: u32,
+        hex_bytes: usize,
     ) -> Result<(Self, u32), String> {
         let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().collect();
         cmdline_w.push(0);
@@ -450,6 +494,9 @@ impl Debugger {
             trace_iat,
             gpa_pending: HashMap::new(),
             pending_returns: HashMap::new(),
+            hex_bytes,
+            max_calls,
+            call_counts: HashMap::new(),
         };
 
         Ok((dbg, pid))
@@ -619,6 +666,25 @@ impl Debugger {
             return;
         }
 
+        // Phase 2.7: auto-unhook — count every hit on persistent hooks and mark
+        // the BP as one-shot once the limit is reached so that handle_single_step
+        // removes it permanently after this execution.
+        if self.max_calls > 0 {
+            let count = self.call_counts.entry((pid, bp_addr)).or_insert(0);
+            *count += 1;
+            if *count >= self.max_calls {
+                if let Some(proc) = self.procs.get_mut(&pid) {
+                    if let Some(bp) = proc.breakpoints.get_mut(&bp_addr) {
+                        bp.one_shot = true;
+                    }
+                }
+                eprintln!(
+                    "[-] {}.{} — auto-unhook after {} call(s)",
+                    target_image, target_routine, self.max_calls,
+                );
+            }
+        }
+
         // Phase 3: log (if within scope).
         let caller_ok = !self.only_main || (retaddr >= main_base && retaddr < main_end);
 
@@ -651,7 +717,7 @@ impl Debugger {
                 .functions
                 .get(&target_routine)
                 .map(|def| {
-                    format_params(proc_handle, &ctx.0, ctx.0.Rsp, def, &self.db.typedefs, modules_slice)
+                    format_params(proc_handle, &ctx.0, ctx.0.Rsp, def, &self.db.typedefs, modules_slice, self.hex_bytes)
                 })
                 .unwrap_or_else(|| {
                     format!(
@@ -772,6 +838,7 @@ impl Debugger {
                 if let Some(proc) = self.procs.get_mut(&pid) {
                     proc.breakpoints.remove(&addr);
                 }
+                self.call_counts.remove(&(pid, addr));
             } else {
                 write_byte(proc_handle, addr, 0xCC);
             }

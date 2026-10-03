@@ -60,6 +60,16 @@ pub fn read_wstr(proc: HANDLE, addr: usize) -> String {
     OsString::from_wide(&units).to_string_lossy().into_owned()
 }
 
+/// Read up to `buf.len()` bytes from `addr`; returns how many were actually read.
+/// Unlike `rpmem`, a partial read (e.g. near a page boundary) is acceptable.
+pub fn read_bytes(proc: HANDLE, addr: usize, buf: &mut [u8]) -> usize {
+    let mut n = 0usize;
+    unsafe {
+        ReadProcessMemory(proc, addr as *const _, buf.as_mut_ptr() as *mut _, buf.len(), &mut n);
+    }
+    n
+}
+
 /// Write a single byte to the target process.
 pub fn write_byte(proc: HANDLE, addr: usize, byte: u8) -> bool {
     let mut written = 0usize;

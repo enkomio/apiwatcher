@@ -72,6 +72,8 @@ The binary is placed in `target\release\apiwatcher.exe`.
 | `--include PATTERN` | — | Always hook functions matching a regex, overriding any exclusion. Repeatable |
 | `--include-file FILE` | `inclusions.txt`* | File with inclusion patterns, one per line |
 | `--defs DIR` | `defs` | Directory containing `.h` function-definition files for parameter decoding |
+| `--max-calls N` | `100` | Auto-unhook a function after it has been intercepted this many times. Reduces overhead for high-frequency APIs once enough calls have been observed. Set to `0` to disable |
+| `--hex-bytes N` | `6` | Hex-dump the first N bytes of buffer-type parameters (`LPBYTE`, `LPVOID`, …), appended as `:{xx xx …}`. Set to `0` to disable |
 
 \* Loaded automatically when the file exists in the current working directory and the explicit option is not given.
 
@@ -133,6 +135,7 @@ timestamp,pid,tid,retaddr,caller_image,bp_addr,target_image,target_routine,param
 | `:"text"` | ANSI string pointer (`LPCSTR`, `char*`, …) | `lpFileName=0x000000a1b2c3d4e5:"C:\file.txt"` |
 | `:L"text"` | Wide string pointer (`LPCWSTR`, `wchar_t*`, …) | `lpFileName=0x000000a1b2c3d4e5:L"C:\file.txt"` |
 | `:[module.dll]` | Generic void pointer (`LPVOID`, `PVOID`, `LPCVOID`) whose value falls inside a known module | `lpAddress=0x00007ff812340000:[kernel32.dll]` |
+| `:{xx xx …}` | Buffer-type pointer (`LPBYTE`, `LPVOID`, raw `void*`, …) not covered by the above — first N bytes shown as hex pairs (N = `--hex-bytes`, default 6) | `lpBuffer=0x000000a1b2c30000:{48 65 6c 6c 6f 0a}` |
 
 ---
 
@@ -214,7 +217,8 @@ Each file should contain standard C function prototypes. The parser handles comm
 
 Parameter values are automatically annotated (see [§5](#5-output-format)):
 - **String pointers** (`LPCSTR`, `char*`, `LPCWSTR`, `wchar_t*`, …) — dereferenced and shown inline as `:"text"` or `:L"text"`.
-- **Generic void pointers** (`LPVOID`, `PVOID`, `LPCVOID`) — annotated with the owning module when the address falls inside a known DLL or EXE (`:[kernel32.dll]`).
+- **Generic void pointers** (`LPVOID`, `PVOID`, `LPCVOID`) — annotated with the owning module when the address falls inside a known DLL or EXE (`:[kernel32.dll]`); otherwise the first bytes are hex-dumped (`:{xx xx …}`).
+- **Byte buffer pointers** (`LPBYTE`, `PBYTE`, `PUCHAR`, raw `void*`) — first bytes hex-dumped (`:{xx xx …}`). Byte count controlled by `--hex-bytes` (default 6, 0 = disabled).
 
 **Bundled definition files:**
 
@@ -269,5 +273,6 @@ To exclude an entire DLL add: `mydll\..*`
 - **IAT mode** (`--trace-iat`) places far fewer breakpoints than EAT mode (tens vs. thousands) and is much less intrusive for targets with many loaded DLLs. Prefer it when you care about what the application calls rather than what libraries export.
 - **Log I/O** is fully decoupled from the debug loop via an `mpsc` channel. The writer thread batches lines into a single `write_all` per burst.
 - **Excluded functions** have zero overhead at runtime — the INT3 byte is never written.
+- **`--max-calls N`** auto-removes a hook after N intercepts, turning a frequently-called API into a zero-overhead function once enough samples have been collected. Useful when EAT mode is needed but a few hot functions would otherwise dominate the overhead.
 - Excluding entire DLLs (e.g. `ntdll\..*`) in EAT mode significantly reduces both the hook count and startup time.
 - The main source of latency in EAT mode is the cross-process memory traffic needed to read each DLL's export table and write breakpoint bytes. On a DLL-heavy process (200+ DLLs) this can take several seconds.

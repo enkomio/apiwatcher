@@ -73,6 +73,18 @@ struct Args {
     #[arg(long = "trace-iat")]
     trace_iat: bool,
 
+    /// Automatically remove a function's hook after it has been intercepted
+    /// this many times.  Reduces overhead for frequently-called APIs that have
+    /// already been observed enough times.  Set to 0 to disable.
+    #[arg(long = "max-calls", default_value = "100", value_name = "N")]
+    max_calls: u32,
+
+    /// Number of bytes to hex-dump for buffer-type parameters (LPBYTE, LPVOID, …).
+    /// The dump is appended as `:{xx xx xx …}` after the pointer value.
+    /// Set to 0 to disable.
+    #[arg(long = "hex-bytes", default_value = "6", value_name = "N")]
+    hex_bytes: usize,
+
     /// Directory containing .h function-definition files
     #[arg(long = "defs", default_value = "defs")]
     defs_dir: String,
@@ -238,8 +250,14 @@ fn main() {
         eprintln!("[*] IAT-trace mode: hooking EXE imports + GetProcAddress-resolved functions");
     }
 
+    if args.max_calls == 0 {
+        eprintln!("[*] Auto-unhook disabled (--max-calls 0)");
+    } else {
+        eprintln!("[*] Auto-unhook after {} call(s) per function (--max-calls)", args.max_calls);
+    }
+
     let (mut dbg, _pid) =
-        Debugger::spawn(&cmdline, csv, args.only_main, args.dll_filter, excluded, included, db, args.trace_iat)
+        Debugger::spawn(&cmdline, csv, args.only_main, args.dll_filter, excluded, included, db, args.trace_iat, args.max_calls, args.hex_bytes)
             .unwrap_or_else(|e| {
                 eprintln!("Failed to launch target: {}", e);
                 std::process::exit(1);
