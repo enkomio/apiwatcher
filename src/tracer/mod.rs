@@ -859,10 +859,11 @@ impl Debugger {
             None => return,
         };
         let exports = parse_exports(proc_handle, base);
-        let count = exports.len();
+        let before = self.procs.get(&pid).map(|p| p.breakpoints.len()).unwrap_or(0);
         for exp in exports {
             self.set_bp(pid, exp.addr, module_name.to_owned(), exp.name);
         }
+        let count = self.procs.get(&pid).map(|p| p.breakpoints.len()).unwrap_or(0) - before;
         if count > 0 {
             eprintln!("[+] PID {} — {} export hook(s) from {}", pid, count, module_name);
         }
@@ -908,10 +909,11 @@ impl Debugger {
             // --trace-iat: hook every function the EXE imports through its IAT.
             // `handle` is Copy and still valid; `parse_imports` doesn't borrow self.
             let imports = parse_imports(handle, base);
-            let count = imports.len();
+            let before = self.procs.get(&pid).map(|p| p.breakpoints.len()).unwrap_or(0);
             for imp in imports {
                 self.set_bp(pid, imp.addr, imp.dll, imp.name);
             }
+            let count = self.procs.get(&pid).map(|p| p.breakpoints.len()).unwrap_or(0) - before;
             if count > 0 {
                 eprintln!("[+] PID {} — {} IAT hook(s) from {}", pid, count, name);
             }

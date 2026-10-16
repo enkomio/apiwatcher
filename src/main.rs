@@ -96,13 +96,27 @@ struct Args {
 
 // ── Exclusion helpers ─────────────────────────────────────────────────────────
 
+/// Returns `true` when `s` looks like a plain DLL filename (e.g. `ntdll.dll`)
+/// rather than a regex pattern.  Heuristic: ends with `.dll` (case-insensitive)
+/// and contains none of the characters that have special meaning in a regex.
+fn looks_like_dll_name(s: &str) -> bool {
+    const SPECIALS: &[char] = &['*', '+', '?', '[', ']', '(', ')', '{', '}', '^', '$', '|', '\\'];
+    s.len() > 4
+        && s[s.len() - 4..].eq_ignore_ascii_case(".dll")
+        && !s.chars().any(|c| SPECIALS.contains(&c))
+}
+
 /// Compile one raw exclusion line into an anchored, case-insensitive `Regex`.
 ///
 /// Matching rules (the regex is tested against two strings in order):
 ///   1. `"dllbasename.funcname"` — dll name with .dll suffix stripped, lowercased
 ///   2. `"funcname"` alone — for patterns without a dll prefix
 ///
-/// Special shorthand: a bare `*` is treated as `.*` (match everything).
+/// Special shorthands:
+///   - A bare `*` is treated as `.*` (match everything).
+///   - A plain DLL filename such as `ntdll.dll` is auto-expanded to `ntdll\..*`
+///     so that the entire DLL is excluded without requiring the user to know
+///     regex syntax.
 ///
 /// Lines that are empty or start with `#` are silently ignored.
 fn parse_exclusion_pattern(raw: &str) -> Option<Regex> {
@@ -110,10 +124,20 @@ fn parse_exclusion_pattern(raw: &str) -> Option<Regex> {
     if s.is_empty() || s.starts_with('#') {
         return None;
     }
-    // Bare '*' is a common glob shorthand for "exclude all".
-    let pat = if s == "*" { ".*" } else { s };
-    // Wrap in a non-capturing group so alternation inside the user's pattern
-    // doesn't escape the anchors, then make the whole thing case-insensitive.
+
+    let pat: String = if looks_like_dll_name(s) {
+        // Escape the basename (handles hyphens, dots in names like api-ms-win-*.dll)
+        // then append \..*  to match all exports.
+        let base = regex::escape(&s[..s.len() - 4]);
+        let expanded = format!("{}\\..*", base);
+        eprintln!("[*] Pattern '{}' auto-expanded to '{}'", s, expanded);
+        expanded
+    } else if s == "*" {
+        ".*".to_owned()
+    } else {
+        s.to_owned()
+    };
+
     match Regex::new(&format!("(?i)^(?:{pat})$")) {
         Ok(re) => Some(re),
         Err(e) => {
